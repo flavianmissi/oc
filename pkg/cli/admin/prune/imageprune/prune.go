@@ -506,6 +506,46 @@ func (p *pruner) analyzeImageReference(referrer resourceReference, subreferrer s
 	}
 	klog.V(4).Infof("%s: %sgot reference to ImageStreamImage %s (registry name is %s)", referrer, logPrefix, isimage, ref.Registry)
 	p.usedImages[isimage] = append(p.usedImages[isimage], referrer)
+
+	// if isimage is a reference to a sub-manifest in a manifest list,
+	// ensure the parent image is also marked as used. if we don't do this,
+	// the tag event for the parent image in the image stream might be pruned,
+	// leading to the sub-manifest/image also getting pruned, even though it is used.
+	for _, is := range p.imageStreams {
+		if is.Namespace != isimage.Namespace {
+			continue
+		}
+		if is.Name != isimage.Name {
+			continue
+		}
+
+		// isimage is part of this image stream.
+		// now find out if it's a sub-image of any images listed.
+		// TODO(flavian): write automated tests
+		// TODO(flavian): find a more elegant way to solve this.
+		for _, tag := range is.Status.Tags {
+			for _, tagEvent := range tag.Items {
+				image, ok := p.images[tagEvent.Image]
+				if !ok {
+					continue
+				}
+				for _, subImageManifest := range image.DockerImageManifests {
+					if subImageManifest.Digest == isimage.Digest {
+						parent := imageStreamImageReference{
+							Namespace: isimage.Namespace,
+							Name:      isimage.Name,
+							Digest:    image.Name,
+						}
+						klog.V(4).Infof(
+							"%s: %skeeping parent reference %s because ImageStreamImage %s is referenced",
+							referrer, logPrefix, parent, isimage,
+						)
+						p.usedImages[parent] = append(p.usedImages[parent], referrer)
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -945,7 +985,10 @@ func (p *pruner) pruneImageStreamTag(is *imagev1.ImageStream, tagEventList image
 			Digest:    item.Image,
 		}
 		if usedBy := p.usedImages[isimage]; len(usedBy) > 0 {
-			klog.V(4).Infof("imagestream %s/%s: tag %s: revision %d: keeping %s because image is used by %s", is.Namespace, is.Name, tagEventList.Tag, rev+1, item.Image, referencesSample(usedBy))
+			klog.V(4).Infof(
+				"imagestream %s/%s: tag %s: revision %d: keeping %s because image is used by %s",
+				is.Namespace, is.Name, tagEventList.Tag, rev+1, item.Image, referencesSample(usedBy),
+			)
 			filteredItems = append(filteredItems, item)
 			continue
 		}
